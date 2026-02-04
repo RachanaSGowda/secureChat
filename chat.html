@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SecureChat</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/jsencrypt/bin/jsencrypt.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+</head>
+<body>
+  <div class="chat-layout">
+    <aside class="sidebar">
+      <h2>SecureChat</h2>
+      <div class="profile">Logged in as <b id="me"></b></div>
+      <input id="contact" placeholder="Recipient username">
+      <button id="loadKey" class="btn">Load Public Key</button>
+      <div class="note">Note: Use different browsers or incognito mode for different users to avoid key conflicts.</div>
+    </aside>
+    <main class="chat-main">
+      <div id="chatBox" class="chatBox"></div>
+      <div class="composer">
+        <input id="msg" placeholder="Type a message...">
+        <button id="sendBtn" class="btn primary">Send</button>
+      </div>
+      <div class="actions"><button id="logout" class="btn">Logout</button></div>
+    </main>
+  </div>
+
+<script>
+const user = localStorage.getItem('user');
+if(!user) window.location.href = '/';
+document.getElementById('me').innerText = user;
+const priv = localStorage.getItem('priv_'+user);
+const myRSA = new JSEncrypt(); myRSA.setPrivateKey(priv);
+let recipientPub = null;
+
+document.getElementById('loadKey').addEventListener('click', async ()=>{
+    const r = document.getElementById('contact').value.trim();
+    if(!r) return alert('enter recipient');
+    const res = await fetch('/public_key/'+r);
+    if(!res.ok) return alert('No such user');
+    const data = await res.json();
+    recipientPub = data.public_key;
+    alert('Loaded public key for '+r);
+});
+
+// connect websocket
+const ws = new WebSocket('ws://'+location.hostname+':6789');
+ws.onopen = ()=>{ ws.send(JSON.stringify({type:'connect', username: user})); }
+ws.onmessage = async (e)=>{
+    const data = JSON.parse(e.data);
+    if(data.type==='message'){
+        if(!priv){
+            alert('Private key not found. Please log in again.');
+            return;
+        }
+        console.log('Received message from ' + data.from);
+        // decrypt AES key using our private RSA
+        const dec = new JSEncrypt(); dec.setPrivateKey(priv);
+        const aesKey = dec.decrypt(data.enc_key);
+        if(!aesKey){
+            alert('Failed to decrypt AES key. The message may be corrupted or intended for a different user.');
+            return;
+        }
+        console.log('AES key: ' + aesKey);
+        const iv = data.iv;
+        const ct = data.ciphertext;
+        try{
+            const plainBytes = CryptoJS.AES.decrypt(ct, CryptoJS.enc.Hex.parse(aesKey), { iv: CryptoJS.enc.Hex.parse(iv) });
+            const text = plainBytes.toString(CryptoJS.enc.Utf8);
+            console.log('Decrypted text: ' + text);
+            const box = document.getElementById('chatBox');
+            box.innerHTML += `<div class="msg other"><b>${data.from}:</b> ${text || '[Failed to decrypt]'}</div>`;
+            box.scrollTop = box.scrollHeight;
+            // Auto-set contact and load public key for reply
+            const contactField = document.getElementById('contact');
+            if(contactField.value.trim() !== data.from){
+                contactField.value = data.from;
+                const res = await fetch('/public_key/'+data.from);
+                if(res.ok){
+                    const keyData = await res.json();
+                    recipientPub = keyData.public_key;
+                }
+            }
+        }catch(err){
+            console.error('decrypt error', err);
+            const box = document.getElementById('chatBox');
+            box.innerHTML += `<div class="msg other"><b>${data.from}:</b> [Decryption error: ${err.message}]</div>`;
+            box.scrollTop = box.scrollHeight;
+        }
+    }
+};
+
+document.getElementById('sendBtn').addEventListener('click', async ()=>{
+    const recipient = document.getElementById('contact').value.trim();
+    const text = document.getElementById('msg').value.trim();
+    if(!recipient||!text) return alert('enter recipient and message');
+    if(!recipientPub) {
+        // Try to load the public key automatically
+        const res = await fetch('/public_key/'+recipient);
+        if(!res.ok) return alert('Failed to load recipient public key. Please check the username.');
+        const data = await res.json();
+        recipientPub = data.public_key;
+    }
+    // generate AES key (128-bit) as hex string
+    const aesKey = CryptoJS.lib.WordArray.random(16).toString(CryptoJS.enc.Hex);
+    const iv = CryptoJS.lib.WordArray.random(16).toString(CryptoJS.enc.Hex);
+    const ct = CryptoJS.AES.encrypt(text, CryptoJS.enc.Hex.parse(aesKey), { iv: CryptoJS.enc.Hex.parse(iv) }).toString();
+    // encrypt AES key with recipient's RSA public key
+    const enc = new JSEncrypt(); enc.setPublicKey(recipientPub);
+    const encKey = enc.encrypt(aesKey);
+    const payload = { type:'send', sender: user, recipient: recipient, ciphertext: ct, enc_key: encKey, iv: iv };
+    ws.send(JSON.stringify(payload));
+    document.getElementById('chatBox').innerHTML += `<div class="msg me"><b>Me:</b> ${text}</div>`;
+    document.getElementById('msg').value='';
+    document.getElementById('chatBox').scrollTop = document.getElementById('chatBox').scrollHeight;
+});
+
+document.getElementById('logout').addEventListener('click', ()=>{ localStorage.removeItem('user'); window.location.href='/'; });
+
+</script>
+</body>
+</html>
